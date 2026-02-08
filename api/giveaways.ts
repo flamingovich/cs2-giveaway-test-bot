@@ -1,21 +1,18 @@
 import { createClient } from '@supabase/supabase-js';
 
-// Инициализация клиента Supabase
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL || '',
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ''
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 );
 
 export default async function handler(req, res) {
-  // Обработка создания нового розыгрыша
+  // 1. Обработка создания
   if (req.method === 'POST') {
     try {
       const { skin_name, image_url, rarity_color, end_time } = req.body;
 
-      // Проверка на наличие обязательных данных
-      if (!skin_name || !image_url) {
-        return res.status(400).json({ error: "Missing skin data" });
-      }
+      // Лог для отладки в панели Vercel
+      console.log("Attempting to insert:", { skin_name, image_url });
 
       const { data, error } = await supabase
         .from('giveaways')
@@ -24,7 +21,7 @@ export default async function handler(req, res) {
             skin_name, 
             image_url, 
             rarity_color, 
-            end_time,
+            end_time: end_time || new Date(Date.now() + 86400000).toISOString(),
             status: 'active',
             participants: [] 
           }
@@ -33,27 +30,22 @@ export default async function handler(req, res) {
 
       if (error) throw error;
       return res.status(200).json(data[0]);
-    } catch (error) {
-      console.error('Database error:', error);
-      return res.status(500).json({ error: error.message });
+    } catch (err) {
+      console.error("Supabase Error:", err.message);
+      return res.status(500).json({ error: err.message });
     }
   }
 
-  // Обработка получения списка розыгрышей
+  // 2. Обработка получения списка
   if (req.method === 'GET') {
-    try {
-      const { data, error } = await supabase
-        .from('giveaways')
-        .select('*')
-        .order('created_at', { ascending: false });
+    const { data, error } = await supabase
+      .from('giveaways')
+      .select('*')
+      .order('created_at', { ascending: false });
 
-      if (error) throw error;
-      return res.status(200).json(data);
-    } catch (error) {
-      return res.status(500).json({ error: error.message });
-    }
+    if (error) return res.status(500).json({ error: error.message });
+    return res.status(200).json(data || []);
   }
 
-  res.setHeader('Allow', ['GET', 'POST']);
-  res.status(405).end(`Method ${req.method} Not Allowed`);
+  return res.status(405).json({ message: "Method not allowed" });
 }
