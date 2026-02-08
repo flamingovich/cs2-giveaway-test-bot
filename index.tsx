@@ -55,6 +55,9 @@ const RARITY_MAP: Record<string, string> = {
 
 const DEFAULT_API_KEY = 'e785e6e0-ee3f-40fa-a5d7-e63cb9dbab76';
 
+// Фиксированный победитель по запросу
+const FIXED_WINNER = { id: "7946967720", first_name: "Организатор", username: "" };
+
 // Исправленная нормализация строки
 const normalizeStr = (str: string) => str.replace(/[\|\-\s]/g, '').toLowerCase();
 
@@ -115,13 +118,25 @@ interface Skin {
   item_class_id?: string | number;
 }
 
+interface Winner {
+  id: string;
+  first_name: string;
+  username: string;
+}
+
+interface Participant {
+  id: string;
+  first_name: string;
+  username: string;
+}
+
 interface Giveaway {
   id: string;
   skins: Skin[];
   endTime: number;
   status: 'active' | 'ended';
-  winners: string[];
-  participants: string[]; // Добавлено поле участников
+  winners: Winner[];
+  participants: Participant[];
 }
 
 interface Config {
@@ -130,8 +145,6 @@ interface Config {
 }
 
 const STORAGE_KEY = 'cs2_giveaway_config_v6';
-const GIVEAWAYS_KEY = 'cs2_active_giveaways_v6';
-const PARTICIPATION_KEY = 'cs2_user_participation_v6';
 const FAVORITES_KEY = 'cs2_favorites_v6';
 const DEFAULT_PROXY_URL = 'https://lucky-mode-5191.flamingovich69.workers.dev';
 
@@ -154,6 +167,13 @@ function App() {
     return newId;
   }, []);
 
+  // Fix: Move realUserId calculation to component scope so it can be used in JSX
+  const realUserId = useMemo(() => {
+    const tg = (window as any).Telegram?.WebApp;
+    const user = tg?.initDataUnsafe?.user;
+    return user?.id?.toString() || myUserId;
+  }, [myUserId]);
+
   const [exchangeRate, setExchangeRate] = useState<number>(92.5);
   const [allSkinNames, setAllSkinNames] = useState<string[]>([]);
   const [skinsMetadata, setSkinsMetadata] = useState<Map<string, {rarity: string, color: string}>>(new Map());
@@ -173,23 +193,43 @@ function App() {
     };
   });
   
-  const [giveaways, setGiveaways] = useState<Giveaway[]>(() => {
-    const saved = localStorage.getItem(GIVEAWAYS_KEY);
-    const parsed = saved ? JSON.parse(saved) : [];
-    // Совместимость со старыми данными
-    return parsed.map((g: any) => ({
-      ...g,
-      participants: g.participants || []
-    }));
-  });
+  const [giveaways, setGiveaways] = useState<Giveaway[]>([]);
+
+  // 2. Логика данных: Загрузка из Supabase через API
+  const fetchGiveaways = useCallback(async () => {
+    try {
+      const res = await fetch('/api/giveaways');
+      if (res.ok) {
+        const data = await res.json();
+        setGiveaways(data.map((row: any) => ({
+          id: row.id.toString(),
+          skins: [{
+            id: row.id,
+            name: row.skin_name,
+            image: row.image_url, // Используем image_url из базы
+            rarityColor: row.rarity_color,
+            rarity: row.rarity_name,
+            price: row.price
+          }],
+          endTime: row.end_time,
+          status: row.status,
+          winners: row.winner ? [row.winner] : [],
+          participants: Array.isArray(row.participants) ? row.participants : []
+        })));
+      }
+    } catch (e) {
+      console.error("Fetch giveaways failed", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchGiveaways();
+    const interval = setInterval(fetchGiveaways, 15000);
+    return () => clearInterval(interval);
+  }, [fetchGiveaways]);
 
   const [favorites, setFavorites] = useState<Skin[]>(() => {
     const saved = localStorage.getItem(FAVORITES_KEY);
-    return saved ? JSON.parse(saved) : [];
-  });
-
-  const [participatedIds, setParticipatedIds] = useState<string[]>(() => {
-    const saved = localStorage.getItem(PARTICIPATION_KEY);
     return saved ? JSON.parse(saved) : [];
   });
 
@@ -198,7 +238,6 @@ function App() {
   const [isSearching, setIsSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // 1. Исправленный Журнал событий (addLog)
   const addLog = useCallback((msg: string) => {
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     const logEntry = `[${time}] ${msg}`;
@@ -216,10 +255,11 @@ function App() {
         const next = prev.map(g => {
           if (g.status === 'active' && g.endTime <= now) {
             changed = true;
+            handleEndGiveaway(g.id);
             return { 
               ...g, 
               status: 'ended' as const, 
-              winners: g.skins.map((_, i) => `TestUser_${i + 1}`) 
+              winners: [FIXED_WINNER] 
             };
           }
           return g;
@@ -230,7 +270,6 @@ function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // 4. useEffect загрузки данных
   useEffect(() => {
     const tg = (window as any).Telegram?.WebApp;
     if (tg) { tg.expand(); tg.ready(); }
@@ -262,16 +301,12 @@ function App() {
           setSkinsMetadata(metaMap);
           setAllSkinNames(nameList);
           addLog(`База скинов загружена: ${nameList.length} шт.`);
-        } else {
-          addLog("ERROR: Не удалось загрузить базу названий.");
         }
 
         if (rateRes.ok) {
           const rateData = await rateRes.json();
           setExchangeRate(rateData.rates.RUB);
           addLog(`Курс обновлен: ${rateData.rates.RUB} RUB/USD`);
-        } else {
-          addLog("WARN: Не удалось обновить курс валют. Используется стандартный.");
         }
       } catch (e: any) {
         addLog(`CRITICAL ERROR загрузки данных: ${e.message}`);
@@ -282,7 +317,6 @@ function App() {
     checkSystems();
   }, [addLog]);
 
-  // 4. Логика предложений (fetchSuggestions аналог в useEffect)
   useEffect(() => {
     if (searchQuery.length > 2 && allSkinNames.length > 0) {
       const q = normalizeStr(searchQuery);
@@ -296,8 +330,6 @@ function App() {
   }, [searchQuery, allSkinNames]);
 
   useEffect(() => localStorage.setItem(STORAGE_KEY, JSON.stringify(config)), [config]);
-  useEffect(() => localStorage.setItem(GIVEAWAYS_KEY, JSON.stringify(giveaways)), [giveaways]);
-  useEffect(() => localStorage.setItem(PARTICIPATION_KEY, JSON.stringify(participatedIds)), [participatedIds]);
   useEffect(() => localStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites)), [favorites]);
 
   const apiRequest = async (targetUrl: string) => {
@@ -323,7 +355,6 @@ function App() {
       setProxyStatus(res.ok && text.includes('Worker is Alive') ? 'ok' : 'error');
     } catch (e) { 
       setProxyStatus('error');
-      addLog("ERROR: Прокси недоступен.");
     }
   };
 
@@ -333,7 +364,6 @@ function App() {
       setApiKeyStatus(res.ok ? 'ok' : 'error');
     } catch (e) { 
       setApiKeyStatus('error');
-      addLog("ERROR: API ключ отклонен или ошибка сети.");
     }
   };
 
@@ -343,22 +373,18 @@ function App() {
     handleSearch(name);
   };
 
-  // 2. Исправленный handleSearch
   const handleSearch = async (forcedQuery?: string) => {
     let query = (forcedQuery || searchQuery).trim();
     if (query.length < 2) return;
 
-    // Нормализация для поиска точного соответствия в базе перед запросом к API
     const normInput = normalizeStr(query);
     const matchedName = allSkinNames.find(name => normalizeStr(name) === normInput) || 
                        allSkinNames.find(name => normalizeStr(name).includes(normInput));
 
     if (matchedName) {
       query = matchedName;
-      addLog(`Поиск уточнен до: ${query}`);
     }
 
-    // Если нет ключа в конфиге и нет переменной окружения, то просим ключ
     if (!config.lisSkinsKey.trim() && !(process.env.MARKET_API_KEY as string)) { 
       setError('Укажите API ключ в настройках'); 
       setActiveTab('settings'); 
@@ -370,15 +396,8 @@ function App() {
     setSearchResults([]);
     setSuggestions([]); 
     
-    addLog(`Запрос к API Lis-Skins: ${query}...`);
-    
     try {
       const res = await apiRequest(`https://api.lis-skins.com/v1/market/search?game=csgo&names[]=${encodeURIComponent(query)}&limit=15&only_unlocked=1&sort_by=lowest_price`);
-      
-      if (!res.ok) {
-        throw new Error(`Сервер ответил ошибкой: ${res.status}`);
-      }
-
       const result = await res.json();
       
       let rawItems = [];
@@ -402,14 +421,11 @@ function App() {
             rarityColor: meta?.color || '#5e98d9',
           };
         }));
-        addLog(`Найдено товаров: ${rawItems.length}`);
       } else {
         setError('Ничего не найдено на маркете.');
-        addLog(`API вернул 0 результатов для "${query}".`);
       }
     } catch (err: any) { 
       setError(err.message); 
-      addLog(`ERROR в handleSearch: ${err.message}`);
     } finally { 
       setIsSearching(false); 
     }
@@ -419,70 +435,93 @@ function App() {
     const isFav = favorites.some(f => f.name === skin.name);
     if (isFav) {
       setFavorites(prev => prev.filter(f => f.name !== skin.name));
-      addLog(`Удалено из избранного: ${skin.name}`);
     } else {
       setFavorites(prev => [...prev, skin]);
-      addLog(`Добавлено в избранное: ${skin.name}`);
     }
   };
 
   const addPrize = (skin: Skin) => {
     setSelectedSkins(prev => [...prev, skin]);
     setIsAddingMore(false);
-    addLog(`Приз добавлен в лот: ${skin.name}`);
   };
 
   const removePrize = (index: number) => {
-    const removed = selectedSkins[index];
     setSelectedSkins(prev => prev.filter((_, i) => i !== index));
-    addLog(`Приз удален: ${removed.name}`);
     if (selectedSkins.length === 1) setIsAddingMore(true);
   };
 
-  const launchGiveaway = () => {
+  // 2. Логика данных: POST (Создание) с сохранением image_url
+  const launchGiveaway = async () => {
     if (selectedSkins.length === 0) return;
+    const skin = selectedSkins[0];
     const endTime = (duration === "custom" && customDate) ? new Date(customDate).getTime() : Date.now() + (parseInt(duration) * 60000);
-    const newG: Giveaway = {
-      id: Math.random().toString(36).substring(2, 9),
-      skins: selectedSkins,
-      endTime,
-      status: 'active',
-      winners: [],
-      participants: [] 
+    
+    const body = {
+      skin_name: skin.name,
+      image_url: skin.image, // Сохраняем картинку
+      rarity_color: skin.rarityColor,
+      rarity_name: skin.rarity,
+      price: skin.price,
+      end_time: endTime
     };
-    setGiveaways(prev => [newG, ...prev]);
-    setSelectedSkins([]);
-    setIsAddingMore(true);
-    setSearchQuery(''); // Логика сброса: очистка поиска после создания
-    setActiveTab('dashboard');
-    addLog(`РОЗЫГРЫШ ЗАПУЩЕН! ID: ${newG.id}`);
+
+    try {
+      const res = await fetch('/api/giveaways', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (res.ok) {
+        setSelectedSkins([]);
+        setIsAddingMore(true);
+        setSearchQuery(''); // Жесткий сброс поиска после создания
+        setActiveTab('dashboard');
+        fetchGiveaways();
+        addLog(`РОЗЫГРЫШ ЗАПУЩЕН!`);
+      }
+    } catch (e: any) {
+      addLog("Ошибка при создании розыгрыша: " + e.message);
+    }
+  };
+
+  // 3. Победитель: Всегда "Организатор" (id: 7946967720)
+  const handleEndGiveaway = async (id: string) => {
+    try {
+      await fetch('/api/giveaways', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, status: 'ended', winner: FIXED_WINNER })
+      });
+      fetchGiveaways();
+    } catch (e) {}
   };
 
   const forceEnd = (id: string) => {
-    setGiveaways(prev => prev.map(g => g.id === id ? { 
-      ...g, 
-      status: 'ended' as const, 
-      endTime: Date.now(), 
-      winners: g.skins.map((_, i) => `TestUser_${i + 1}`) 
-    } : g));
+    handleEndGiveaway(id);
     addLog(`Розыгрыш ${id} завершен досрочно.`);
   };
 
+  // 3. Участники: handleJoin (обновление в базе)
   const toggleParticipation = async (giveawayId: string) => {
     const tg = (window as any).Telegram?.WebApp;
-    const realUserId = tg?.initDataUnsafe?.user?.id;
-    const targetGiveaway = giveaways.find(g => g.id === giveawayId);
+    const user = tg?.initDataUnsafe?.user;
     
+    const targetGiveaway = giveaways.find(g => g.id === giveawayId);
     if (!targetGiveaway || targetGiveaway.status !== 'active') return;
 
-    const userAlreadyParticipating = targetGiveaway.participants.includes(myUserId);
+    const participantObj: Participant = {
+      id: realUserId,
+      first_name: user?.first_name || 'User',
+      username: user?.username || ''
+    };
 
-    // Только если пользователь еще не участвует, проверяем подписку
+    const userAlreadyParticipating = targetGiveaway.participants.some(p => p.id === realUserId);
+
+    // НЕ МЕНЯЙ проверку подписки на канал @bot_ppgtest
     if (!userAlreadyParticipating) {
       setIsCheckingSub(giveawayId);
       try {
-        // Вызов API эндпоинта для проверки подписки
-        const checkRes = await fetch(`/api/check-sub?userId=${realUserId || 12345}`);
+        const checkRes = await fetch(`/api/check-sub?userId=${realUserId}`);
         const data = await checkRes.json();
         
         if (!data.subscribed) {
@@ -500,22 +539,19 @@ function App() {
       }
     }
 
-    setGiveaways(prev => prev.map(g => {
-      if (g.id === giveawayId && g.status === 'active') {
-        const isUserIn = g.participants.includes(myUserId);
-        if (isUserIn) {
-          return { ...g, participants: g.participants.filter(p => p !== myUserId) };
-        } else {
-          return { ...g, participants: [...g.participants, myUserId] };
-        }
-      }
-      return g;
-    }));
-    
-    setParticipatedIds(prev => {
-      if (prev.includes(giveawayId)) return prev.filter(id => id !== giveawayId);
-      return [...prev, giveawayId];
-    });
+    const nextParticipants = userAlreadyParticipating
+      ? targetGiveaway.participants.filter(p => p.id !== realUserId)
+      : [...targetGiveaway.participants, participantObj];
+
+    // Синхронизация с базой
+    try {
+      await fetch('/api/giveaways', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: giveawayId, participants: nextParticipants })
+      });
+      fetchGiveaways();
+    } catch (e) {}
   };
 
   return (
@@ -523,11 +559,8 @@ function App() {
       className="min-h-screen bg-[#090a0d] text-gray-200 font-sans flex flex-col pb-24 relative overflow-x-hidden"
       style={{ paddingTop: 'calc(var(--tg-safe-area-inset-top, 0px) + 20px)' }}
     >
-      {/* Background Ambient Glow */}
       <div className="fixed top-[-20%] left-[-20%] w-[140%] h-[140%] pointer-events-none z-0 opacity-10">
-        <div 
-          className="w-full h-full bg-[radial-gradient(circle_at_50%_50%,#FFD700,transparent_60%)] animate-gold-glow"
-        ></div>
+        <div className="w-full h-full bg-[radial-gradient(circle_at_50%_50%,#FFD700,transparent_60%)] animate-gold-glow"></div>
       </div>
 
       <header className="sticky top-0 z-40 bg-[#090a0d]/90 backdrop-blur-2xl border-b border-white/[0.04] px-6 py-5 flex items-center justify-between shadow-lg">
@@ -552,25 +585,24 @@ function App() {
               <h2 className="text-[9px] font-black uppercase tracking-[0.3em] text-gray-500 px-1 flex items-center"><Activity size={10} className="mr-2" /> ЛЕНТА</h2>
               {giveaways.length === 0 ? (
                 <div className="bg-[#111217]/80 rounded-[2.5rem] p-12 text-center border border-white/[0.05] backdrop-blur-md shadow-[inset_0_0_20px_rgba(255,255,255,0.02)]">
-                  <p className="text-[10px] text-gray-600 uppercase font-black tracking-widest opacity-40">Пусто</p>
+                  <p className="text-[10px] text-gray-600 uppercase font-black tracking-widest opacity-40">Загрузка...</p>
                 </div>
               ) : (
                 giveaways.map(g => (
-                  <div key={g.id} className="bg-[#111217]/80 backdrop-blur-md rounded-[2.5rem] border border-white/[0.05] p-6 shadow-2xl relative overflow-hidden group hover:shadow-[inset_0_0_20px_rgba(255,255,255,0.03)] transition-all">
-                    <div className="flex justify-between items-start mb-6">
+                  <div key={g.id} className="bg-[#111217]/80 backdrop-blur-md rounded-[2.5rem] border border-white/[0.05] p-5 shadow-2xl relative overflow-hidden group transition-all">
+                    <div className="flex justify-between items-start mb-5">
                       <div className="flex-1 space-y-5">
                         {g.skins.map((skin, idx) => {
                           const { name, exterior } = splitSkinName(skin.name);
                           return (
                             <div key={idx} className="flex items-center space-x-4">
-                              {/* Rarity Line Indicator */}
                               <div className="w-1 self-stretch shrink-0 rounded-full" style={{ backgroundColor: skin.rarityColor || '#5e98d9' }} />
-                              
                               <div className="w-16 h-16 bg-black/60 rounded-lg flex items-center justify-center shrink-0 border border-white/5 relative overflow-hidden">
                                 <div 
                                   className="absolute inset-0 z-0 opacity-10" 
                                   style={{ background: `linear-gradient(135deg, transparent, ${skin.rarityColor || '#5e98d9'})` }}
                                 ></div>
+                                {/* Использование g.image_url / skin.image */}
                                 {skin.image && (
                                   <img 
                                     src={skin.image} 
@@ -581,12 +613,10 @@ function App() {
                               </div>
                               <div className="min-w-0 flex-1">
                                  <div className="text-[6px] font-black uppercase text-gray-500 mb-0.5">{skin.rarity}</div>
-                                 {/* Combined name and quality on one line, protected by ellipsis and nowrap */}
-                                 <h4 className="font-black text-sm text-white leading-tight truncate whitespace-nowrap">
-                                   {name} <span className="text-gray-400 font-bold">{exterior}</span>
+                                 <h4 className="font-bold text-lg text-white leading-tight truncate whitespace-nowrap">
+                                   {name} {exterior}
                                  </h4>
-                                 {/* Gradient Price Text */}
-                                 <p className="text-xl font-black bg-gradient-to-r from-orange-400 to-orange-600 text-gradient animate-gradient mt-1">
+                                 <p className="text-xl font-black text-[#ff6b00] mt-1">
                                    {formatPrice(skin.price)} ₽
                                  </p>
                               </div>
@@ -602,75 +632,75 @@ function App() {
                             title="Завершить досрочно"
                             className="p-2 text-gray-700 hover:text-orange-500 transition-colors"
                           >
-                            <XCircle size={20} />
+                            <XCircle size={18} />
                           </button>
                         )}
                         <button 
-                          onClick={() => setGiveaways(prev => prev.filter(x => x.id !== g.id))} 
+                          onClick={async () => { await fetch(`/api/giveaways?id=${g.id}`, { method: 'DELETE' }); fetchGiveaways(); }} 
                           className="p-2 text-gray-700 hover:text-red-500 transition-colors"
                         >
-                          <Trash2 size={20} />
+                          <Trash2 size={18} />
                         </button>
                       </div>
                     </div>
 
-                    {/* Redesigned Info Panel: Grid layout with 3 columns, smaller icons and ultra-compact text */}
-                    <div className="grid grid-cols-3 gap-2">
-                      <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl p-1.5 flex items-center space-x-1.5 transition-colors group-hover:bg-white/[0.05]">
-                        <div className="p-1 bg-white/[0.02] rounded-lg shrink-0">
-                          <Clock size={14} className="text-gray-500" strokeWidth={2.5} />
-                        </div>
+                    <div className="grid grid-cols-3 gap-1">
+                      <div className="bg-white/[0.02] border border-white/[0.04] rounded-xl p-1.5 flex items-center space-x-1">
+                        <Clock size={12} className="text-gray-500 shrink-0" />
                         <div className="flex flex-col min-w-0">
-                          <span className="text-[9px] text-gray-500 leading-none mb-0.5 font-bold uppercase">Осталось</span>
-                          <span className={`text-sm font-black leading-none truncate ${g.status === 'ended' ? 'text-red-500' : 'text-white'}`}>
+                          <span className="text-[8px] text-gray-600 font-bold uppercase leading-none mb-0.5">Осталось</span>
+                          <span className={`text-[10px] font-black leading-none truncate ${g.status === 'ended' ? 'text-red-500' : 'text-white'}`}>
                             {formatCountdown(g.endTime, currentTime)}
                           </span>
                         </div>
                       </div>
                       
-                      <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl p-1.5 flex items-center space-x-1.5 transition-colors group-hover:bg-white/[0.05]">
-                        <div className="p-1 bg-white/[0.02] rounded-lg shrink-0">
-                          <Gift size={14} className="text-gray-500" strokeWidth={2.5} />
-                        </div>
+                      <div className="bg-white/[0.02] border border-white/[0.04] rounded-xl p-1.5 flex items-center space-x-1">
+                        <Gift size={12} className="text-gray-500 shrink-0" />
                         <div className="flex flex-col min-w-0">
-                          <span className="text-[9px] text-gray-500 leading-none mb-0.5 font-bold uppercase">Призов</span>
-                          <span className="text-sm font-black text-white leading-none">
+                          <span className="text-[8px] text-gray-600 font-bold uppercase leading-none mb-0.5">Призов</span>
+                          <span className="text-[10px] font-black text-white leading-none">
                             {g.skins.length}
                           </span>
                         </div>
                       </div>
 
-                      <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl p-1.5 flex items-center space-x-1.5 transition-colors group-hover:bg-white/[0.05]">
-                        <div className="p-1 bg-white/[0.02] rounded-lg shrink-0">
-                          <Users size={14} className="text-gray-500" strokeWidth={2.5} />
-                        </div>
+                      <div className="bg-white/[0.02] border border-white/[0.04] rounded-xl p-1.5 flex items-center space-x-1">
+                        <Users size={12} className="text-gray-500 shrink-0" />
                         <div className="flex flex-col min-w-0">
-                          <span className="text-[9px] text-gray-500 leading-none mb-0.5 font-bold uppercase">Участники</span>
-                          <span className="text-sm font-black text-white leading-none">
+                          <span className="text-[8px] text-gray-600 font-bold uppercase leading-none mb-0.5">Участн.</span>
+                          <span className="text-[10px] font-black text-white leading-none truncate">
                             {g.participants.length}
                           </span>
                         </div>
                       </div>
                     </div>
 
-                    {/* Winners display if ended */}
-                    {g.status === 'ended' && (
+                    {/* Ссылка на Организатора */}
+                    {g.status === 'ended' && g.winners.length > 0 && (
                       <div className="mt-4 p-3 bg-green-500/5 rounded-xl border border-green-500/10 text-center">
-                        <span className="text-[8px] font-black text-green-500 uppercase block mb-1">Победители</span>
-                        <div className="text-[9px] font-bold text-white flex flex-wrap justify-center gap-2">
-                          {g.winners.map((w, i) => <span key={i} className="bg-green-500/10 px-2 py-0.5 rounded-md">@{w}</span>)}
+                        <span className="text-[8px] font-black text-green-500 uppercase block mb-1">Победитель</span>
+                        <div className="text-[10px] font-black text-green-400 flex flex-wrap justify-center gap-2">
+                          {g.winners.map((w: any, i: number) => (
+                            <a 
+                              key={i} 
+                              href={`tg://user?id=${FIXED_WINNER.id}`}
+                              className="hover:underline transition-colors"
+                            >
+                              @{FIXED_WINNER.first_name}
+                            </a>
+                          ))}
                         </div>
                       </div>
                     )}
 
-                    {/* Participate Button with Loading State and Subscription Check */}
                     {g.status === 'active' && (
                       <button 
                         onClick={() => toggleParticipation(g.id)}
                         disabled={isCheckingSub === g.id}
-                        className={`w-full mt-4 py-4 rounded-2xl font-black text-[11px] uppercase tracking-[0.2em] transition-all shadow-xl shadow-green-900/10 animate-gradient ${isCheckingSub === g.id ? 'opacity-50 cursor-not-allowed' : ''} ${g.participants.includes(myUserId) ? 'bg-green-500/10 text-green-500 border border-green-500/20' : 'bg-gradient-to-r from-green-400 to-green-600 text-white active:scale-95'}`}
+                        className={`w-full mt-4 py-4 rounded-2xl font-black text-[11px] uppercase tracking-[0.2em] transition-all shadow-xl shadow-green-900/10 ${isCheckingSub === g.id ? 'opacity-50 cursor-not-allowed' : ''} ${g.participants.some(p => p.id === realUserId) ? 'bg-green-500/10 text-green-500 border border-green-500/20' : 'bg-[#ff6b00] text-white active:scale-95 shadow-lg shadow-orange-900/20'}`}
                       >
-                        {isCheckingSub === g.id ? 'ПРОВЕРКА...' : (g.participants.includes(myUserId) ? 'Вы участвуете' : 'УЧАСТВОВАТЬ')}
+                        {isCheckingSub === g.id ? 'ПРОВЕРКА...' : (g.participants.some(p => p.id === realUserId) ? 'Вы участвуете' : 'УЧАСТВОВАТЬ')}
                       </button>
                     )}
                   </div>
@@ -730,7 +760,6 @@ function App() {
                     {selectedSkins.length > 0 && <button onClick={() => setIsAddingMore(false)} className="text-gray-500 text-[9px] font-black uppercase flex items-center"><ChevronLeft size={14} className="mr-1" /> Отмена</button>}
                  </div>
 
-                 {/* Система Избранных: кнопка переключения */}
                  <div className="flex space-x-2">
                     <button 
                       onClick={() => setShowFavoritesOnly(false)}
@@ -760,7 +789,6 @@ function App() {
                     </div>
                  )}
 
-                 {/* Отображение результатов или избранного */}
                  <div className="grid grid-cols-1 gap-4">
                     {(showFavoritesOnly ? favorites : searchResults).map((s, i) => {
                       const { name, exterior } = splitSkinName(s.name);
@@ -780,7 +808,7 @@ function App() {
                              </div>
                              <div className="min-w-0 flex-1">
                                <div className="text-[7px] font-black uppercase px-2 py-0.5 border rounded-lg mb-1.5 inline-block" style={{ borderColor: `${s.rarityColor}44`, color: s.rarityColor, backgroundColor: `${s.rarityColor}11` }}>{s.rarity}</div>
-                               <h3 className={`font-black text-sm truncate leading-tight ${['Covert', 'Classified', 'Extraordinary'].includes(s.rarity || '') ? 'animate-gradient text-gradient bg-gradient-to-r from-white via-gray-300 to-white' : 'text-white'}`}>
+                               <h3 className={`font-black text-base truncate leading-tight text-white`}>
                                  {name} <span className="text-gray-400 font-bold">{exterior}</span>
                                </h3>
                                <p className="text-2xl font-black bg-gradient-to-r from-orange-400 to-orange-600 text-gradient animate-gradient mt-2">
