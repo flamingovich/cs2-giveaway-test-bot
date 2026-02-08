@@ -25,6 +25,36 @@
         :root {
           --tg-theme-bg-color: #0d0f13;
         }
+        @keyframes gradientFlow {
+          0% { background-position: 0% 50%; }
+          50% { background-position: 100% 50%; }
+          100% { background-position: 0% 50%; }
+        }
+        @keyframes pulseGlow {
+          0% { opacity: 0.2; transform: scale(0.8); }
+          50% { opacity: 0.4; transform: scale(1.1); }
+          100% { opacity: 0.2; transform: scale(0.8); }
+        }
+        @keyframes goldGlow {
+          0% { opacity: 0.05; transform: scale(1); }
+          50% { opacity: 0.15; transform: scale(1.1); }
+          100% { opacity: 0.05; transform: scale(1); }
+        }
+        .animate-gradient {
+          background-size: 200% 200% !important;
+          animation: gradientFlow 3s ease infinite !important;
+        }
+        .animate-pulse-glow {
+          animation: pulseGlow 4s ease-in-out infinite;
+        }
+        .animate-gold-glow {
+          animation: goldGlow 8s ease-in-out infinite;
+        }
+        .text-gradient {
+          -webkit-background-clip: text !important;
+          background-clip: text !important;
+          color: transparent !important;
+        }
         body {
             margin: 0;
             background-color: var(--tg-theme-bg-color);

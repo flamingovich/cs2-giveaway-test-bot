@@ -1,5 +1,4 @@
-
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { 
   Search, 
@@ -54,6 +53,8 @@ const RARITY_MAP: Record<string, string> = {
   "Contraband": "Контрабанда"
 };
 
+const DEFAULT_API_KEY = 'e785e6e0-ee3f-40fa-a5d7-e63cb9dbab76';
+
 // Исправленная нормализация строки
 const normalizeStr = (str: string) => str.replace(/[\|\-\s]/g, '').toLowerCase();
 
@@ -68,6 +69,14 @@ const localizeName = (name: string) => {
     localized = localized.replace(`(${en})`, `(${ru})`);
   });
   return localized;
+};
+
+// Хелпер для разделения названия и износа
+const splitSkinName = (fullName: string) => {
+  const parts = fullName.split(' (');
+  const name = parts[0];
+  const exterior = parts[1] ? `(${parts[1]}` : '';
+  return { name, exterior };
 };
 
 const localizeRarity = (rarity: string) => {
@@ -112,6 +121,7 @@ interface Giveaway {
   endTime: number;
   status: 'active' | 'ended';
   winners: string[];
+  participants: string[]; // Добавлено поле участников
 }
 
 interface Config {
@@ -132,7 +142,17 @@ function App() {
   const [apiKeyStatus, setApiKeyStatus] = useState<'unknown' | 'ok' | 'error'>('unknown');
   const [showKey, setShowKey] = useState(false);
   const [currentTime, setCurrentTime] = useState(Date.now());
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
   
+  // Идентификатор текущего пользователя для имитации системы
+  const myUserId = useMemo(() => {
+    const saved = localStorage.getItem('cs2_mock_uid');
+    if (saved) return saved;
+    const newId = 'user_' + Math.random().toString(36).substring(2, 9);
+    localStorage.setItem('cs2_mock_uid', newId);
+    return newId;
+  }, []);
+
   const [exchangeRate, setExchangeRate] = useState<number>(92.5);
   const [allSkinNames, setAllSkinNames] = useState<string[]>([]);
   const [skinsMetadata, setSkinsMetadata] = useState<Map<string, {rarity: string, color: string}>>(new Map());
@@ -147,14 +167,19 @@ function App() {
     const saved = localStorage.getItem(STORAGE_KEY);
     const parsed = saved ? JSON.parse(saved) : {};
     return {
-      lisSkinsKey: (parsed.lisSkinsKey || '').trim(),
+      lisSkinsKey: (parsed.lisSkinsKey || DEFAULT_API_KEY).trim(),
       customProxyUrl: (parsed.customProxyUrl || DEFAULT_PROXY_URL).trim(),
     };
   });
   
   const [giveaways, setGiveaways] = useState<Giveaway[]>(() => {
     const saved = localStorage.getItem(GIVEAWAYS_KEY);
-    return saved ? JSON.parse(saved) : [];
+    const parsed = saved ? JSON.parse(saved) : [];
+    // Совместимость со старыми данными
+    return parsed.map((g: any) => ({
+      ...g,
+      participants: g.participants || []
+    }));
   });
 
   const [favorites, setFavorites] = useState<Skin[]>(() => {
@@ -275,7 +300,7 @@ function App() {
   useEffect(() => localStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites)), [favorites]);
 
   const apiRequest = async (targetUrl: string) => {
-    const rawKey = config.lisSkinsKey.trim();
+    const rawKey = ((process.env.MARKET_API_KEY as string) || config.lisSkinsKey || DEFAULT_API_KEY).trim();
     const proxy = config.customProxyUrl || DEFAULT_PROXY_URL;
     const finalProxyUrl = `${proxy.endsWith('/') ? proxy : proxy + '/'}?url=${encodeURIComponent(targetUrl)}`;
     
@@ -287,7 +312,7 @@ function App() {
 
   const checkSystems = async () => {
     await testProxy();
-    if (config.lisSkinsKey) await validateApiKey();
+    if (config.lisSkinsKey || (process.env.MARKET_API_KEY as string)) await validateApiKey();
   };
 
   const testProxy = async () => {
@@ -332,7 +357,8 @@ function App() {
       addLog(`Поиск уточнен до: ${query}`);
     }
 
-    if (!config.lisSkinsKey.trim()) { 
+    // Если нет ключа в конфиге и нет переменной окружения, то просим ключ
+    if (!config.lisSkinsKey.trim() && !(process.env.MARKET_API_KEY as string)) { 
       setError('Укажите API ключ в настройках'); 
       setActiveTab('settings'); 
       return; 
@@ -420,11 +446,13 @@ function App() {
       skins: selectedSkins,
       endTime,
       status: 'active',
-      winners: []
+      winners: [],
+      participants: [] 
     };
     setGiveaways(prev => [newG, ...prev]);
     setSelectedSkins([]);
     setIsAddingMore(true);
+    setSearchQuery(''); // Логика сброса: очистка поиска после создания
     setActiveTab('dashboard');
     addLog(`РОЗЫГРЫШ ЗАПУЩЕН! ID: ${newG.id}`);
   };
@@ -439,8 +467,37 @@ function App() {
     addLog(`Розыгрыш ${id} завершен досрочно.`);
   };
 
+  const toggleParticipation = (giveawayId: string) => {
+    setGiveaways(prev => prev.map(g => {
+      if (g.id === giveawayId && g.status === 'active') {
+        const isAlreadyIn = g.participants.includes(myUserId);
+        if (isAlreadyIn) {
+          return { ...g, participants: g.participants.filter(p => p !== myUserId) };
+        } else {
+          return { ...g, participants: [...g.participants, myUserId] };
+        }
+      }
+      return g;
+    }));
+    
+    setParticipatedIds(prev => {
+      if (prev.includes(giveawayId)) return prev.filter(id => id !== giveawayId);
+      return [...prev, giveawayId];
+    });
+  };
+
   return (
-    <div className="min-h-screen bg-[#090a0d] text-gray-200 font-sans flex flex-col pb-24">
+    <div 
+      className="min-h-screen bg-[#090a0d] text-gray-200 font-sans flex flex-col pb-24 relative overflow-x-hidden"
+      style={{ paddingTop: 'calc(var(--tg-safe-area-inset-top, 0px) + 20px)' }}
+    >
+      {/* Background Ambient Glow */}
+      <div className="fixed top-[-20%] left-[-20%] w-[140%] h-[140%] pointer-events-none z-0 opacity-10">
+        <div 
+          className="w-full h-full bg-[radial-gradient(circle_at_50%_50%,#FFD700,transparent_60%)] animate-gold-glow"
+        ></div>
+      </div>
+
       <header className="sticky top-0 z-40 bg-[#090a0d]/90 backdrop-blur-2xl border-b border-white/[0.04] px-6 py-5 flex items-center justify-between shadow-lg">
         <div className="flex items-center space-x-3">
           <div className="w-10 h-10 bg-[#ff6b00] rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(255,107,0,0.3)]">
@@ -454,7 +511,7 @@ function App() {
         </div>
       </header>
 
-      <main className="flex-1 px-4 py-6 overflow-x-hidden">
+      <main className="flex-1 px-4 py-6 overflow-x-hidden relative z-10">
         {activeTab === 'dashboard' && (
           <div className="space-y-6 animate-in fade-in duration-500">
             <StatsCard title="Активных розыгрышей" value={giveaways.filter(g => g.status === 'active').length} icon={<Trophy size={16} />} />
@@ -462,70 +519,125 @@ function App() {
             <div className="space-y-4">
               <h2 className="text-[9px] font-black uppercase tracking-[0.3em] text-gray-500 px-1 flex items-center"><Activity size={10} className="mr-2" /> ЛЕНТА</h2>
               {giveaways.length === 0 ? (
-                <div className="bg-[#111217] rounded-[2.5rem] p-12 text-center border border-white/[0.02]">
+                <div className="bg-[#111217]/80 rounded-[2.5rem] p-12 text-center border border-white/[0.05] backdrop-blur-md shadow-[inset_0_0_20px_rgba(255,255,255,0.02)]">
                   <p className="text-[10px] text-gray-600 uppercase font-black tracking-widest opacity-40">Пусто</p>
                 </div>
               ) : (
                 giveaways.map(g => (
-                  <div key={g.id} className="bg-[#111217] rounded-[2.5rem] border border-white/[0.04] p-6 shadow-2xl relative overflow-hidden group">
-                    <div className="flex justify-between items-start mb-4">
-                      <div className="flex-1 space-y-4">
-                        {g.skins.map((skin, idx) => (
-                          <div key={idx} className="flex items-center space-x-4">
-                            {/* Rarity Line Indicator */}
-                            <div className="w-1 self-stretch shrink-0 rounded-full" style={{ backgroundColor: skin.rarityColor || '#5e98d9' }} />
-                            
-                            {/* Larger Skin Image Container - Glow Removed */}
-                            <div className="w-16 h-16 bg-black/60 rounded-lg flex items-center justify-center shrink-0 border border-white/5 relative">
-                              {skin.image && <img src={skin.image} className="w-full h-full object-contain relative z-10" style={{ mixBlendMode: 'screen' }} />}
+                  <div key={g.id} className="bg-[#111217]/80 backdrop-blur-md rounded-[2.5rem] border border-white/[0.05] p-6 shadow-2xl relative overflow-hidden group hover:shadow-[inset_0_0_20px_rgba(255,255,255,0.03)] transition-all">
+                    <div className="flex justify-between items-start mb-6">
+                      <div className="flex-1 space-y-5">
+                        {g.skins.map((skin, idx) => {
+                          const { name, exterior } = splitSkinName(skin.name);
+                          return (
+                            <div key={idx} className="flex items-center space-x-4">
+                              {/* Rarity Line Indicator */}
+                              <div className="w-1 self-stretch shrink-0 rounded-full" style={{ backgroundColor: skin.rarityColor || '#5e98d9' }} />
+                              
+                              <div className="w-16 h-16 bg-black/60 rounded-lg flex items-center justify-center shrink-0 border border-white/5 relative overflow-hidden">
+                                <div 
+                                  className="absolute inset-0 z-0 opacity-10" 
+                                  style={{ background: `linear-gradient(135deg, transparent, ${skin.rarityColor || '#5e98d9'})` }}
+                                ></div>
+                                {skin.image && (
+                                  <img 
+                                    src={skin.image} 
+                                    className="w-full h-full object-contain relative z-10" 
+                                    style={{ mixBlendMode: 'screen' }} 
+                                  />
+                                )}
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                 <div className="text-[6px] font-black uppercase text-gray-500 mb-0.5">{skin.rarity}</div>
+                                 {/* Combined name and quality on one line, protected by ellipsis and nowrap */}
+                                 <h4 className="font-black text-sm text-white leading-tight truncate whitespace-nowrap">
+                                   {name} <span className="text-gray-400 font-bold">{exterior}</span>
+                                 </h4>
+                                 {/* Gradient Price Text */}
+                                 <p className="text-xl font-black bg-gradient-to-r from-orange-400 to-orange-600 text-gradient animate-gradient mt-1">
+                                   {formatPrice(skin.price)} ₽
+                                 </p>
+                              </div>
                             </div>
-                            <div className="min-w-0 flex-1">
-                               <div className="text-[6px] font-black uppercase text-gray-500">{skin.rarity}</div>
-                               <h4 className="font-bold text-xs text-white truncate">{skin.name}</h4>
-                               {/* Increased Price Size */}
-                               <p className="text-[#ff6b00] font-black text-lg">{formatPrice(skin.price)} ₽</p>
-                            </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
+                      
                       <div className="flex space-x-1">
                         {g.status === 'active' && (
-                          <button onClick={() => forceEnd(g.id)} className="p-2 text-gray-700 hover:text-orange-500"><XCircle size={18} /></button>
+                          <button 
+                            onClick={() => forceEnd(g.id)} 
+                            title="Завершить досрочно"
+                            className="p-2 text-gray-700 hover:text-orange-500 transition-colors"
+                          >
+                            <XCircle size={20} />
+                          </button>
                         )}
-                        <button onClick={() => setGiveaways(prev => prev.filter(x => x.id !== g.id))} className="p-2 text-gray-700 hover:text-red-500"><Trash2 size={18} /></button>
+                        <button 
+                          onClick={() => setGiveaways(prev => prev.filter(x => x.id !== g.id))} 
+                          className="p-2 text-gray-700 hover:text-red-500 transition-colors"
+                        >
+                          <Trash2 size={20} />
+                        </button>
                       </div>
                     </div>
 
-                    {/* Stats: Smaller and neater */}
-                    <div className="flex items-center justify-between bg-black/40 rounded-2xl p-3 border border-white/[0.02]">
-                      <div className="flex items-center space-x-4">
-                        <div className="flex flex-col">
-                          <span className="text-[8px] font-bold text-gray-500 uppercase">ОСТАЛОСЬ</span>
-                          <span className={`text-base font-black leading-none ${g.status === 'ended' ? 'text-red-500' : 'text-white'}`}>{formatCountdown(g.endTime, currentTime)}</span>
+                    {/* Redesigned Info Panel: Grid layout with 3 columns, smaller icons and ultra-compact text */}
+                    <div className="grid grid-cols-3 gap-2">
+                      <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl p-1.5 flex items-center space-x-1.5 transition-colors group-hover:bg-white/[0.05]">
+                        <div className="p-1 bg-white/[0.02] rounded-lg shrink-0">
+                          <Clock size={14} className="text-gray-500" strokeWidth={2.5} />
                         </div>
-                        <div className="w-px h-6 bg-white/5"></div>
-                        <div className="flex flex-col">
-                          <span className="text-[8px] font-bold text-gray-500 uppercase">ПРИЗОВ</span>
-                          <span className="text-base font-black text-white leading-none">{g.skins.length}</span>
+                        <div className="flex flex-col min-w-0">
+                          <span className="text-[9px] text-gray-500 leading-none mb-0.5 font-bold uppercase">Осталось</span>
+                          <span className={`text-sm font-black leading-none truncate ${g.status === 'ended' ? 'text-red-500' : 'text-white'}`}>
+                            {formatCountdown(g.endTime, currentTime)}
+                          </span>
                         </div>
                       </div>
-                      {g.status === 'ended' && (
-                        <div className="text-right">
-                          <span className="text-[8px] font-bold text-gray-500 uppercase block">ПОБЕДИТЕЛИ</span>
-                          <div className="text-[8px] font-black text-green-400 flex flex-wrap justify-end gap-x-1">
-                            {g.winners.map((w, i) => <span key={i}>@{w}</span>)}
-                          </div>
+                      
+                      <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl p-1.5 flex items-center space-x-1.5 transition-colors group-hover:bg-white/[0.05]">
+                        <div className="p-1 bg-white/[0.02] rounded-lg shrink-0">
+                          <Gift size={14} className="text-gray-500" strokeWidth={2.5} />
                         </div>
-                      )}
+                        <div className="flex flex-col min-w-0">
+                          <span className="text-[9px] text-gray-500 leading-none mb-0.5 font-bold uppercase">Призов</span>
+                          <span className="text-sm font-black text-white leading-none">
+                            {g.skins.length}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl p-1.5 flex items-center space-x-1.5 transition-colors group-hover:bg-white/[0.05]">
+                        <div className="p-1 bg-white/[0.02] rounded-lg shrink-0">
+                          <Users size={14} className="text-gray-500" strokeWidth={2.5} />
+                        </div>
+                        <div className="flex flex-col min-w-0">
+                          <span className="text-[9px] text-gray-500 leading-none mb-0.5 font-bold uppercase">Участники</span>
+                          <span className="text-sm font-black text-white leading-none">
+                            {g.participants.length}
+                          </span>
+                        </div>
+                      </div>
                     </div>
 
-                    {/* Participate Button: Changed to Green */}
+                    {/* Winners display if ended */}
+                    {g.status === 'ended' && (
+                      <div className="mt-4 p-3 bg-green-500/5 rounded-xl border border-green-500/10 text-center">
+                        <span className="text-[8px] font-black text-green-500 uppercase block mb-1">Победители</span>
+                        <div className="text-[9px] font-bold text-white flex flex-wrap justify-center gap-2">
+                          {g.winners.map((w, i) => <span key={i} className="bg-green-500/10 px-2 py-0.5 rounded-md">@{w}</span>)}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Participate Button with Animated Gradient */}
                     {g.status === 'active' && (
                       <button 
-                        onClick={() => !participatedIds.includes(g.id) && setParticipatedIds(prev => [...prev, g.id])}
-                        className={`w-full mt-4 py-4 rounded-2xl font-black text-[10px] uppercase tracking-[0.2em] transition-all shadow-lg ${participatedIds.includes(g.id) ? 'bg-green-500/10 text-green-500' : 'bg-[#22c55e] hover:bg-green-600 text-white active:scale-95 shadow-green-900/20'}`}
+                        onClick={() => toggleParticipation(g.id)}
+                        className={`w-full mt-4 py-4 rounded-2xl font-black text-[11px] uppercase tracking-[0.2em] transition-all shadow-xl shadow-green-900/10 animate-gradient ${g.participants.includes(myUserId) ? 'bg-green-500/10 text-green-500 border border-green-500/20' : 'bg-gradient-to-r from-green-400 to-green-600 text-white active:scale-95'}`}
                       >
-                        {participatedIds.includes(g.id) ? 'Вы участвуете' : 'УЧАСТВОВАТЬ'}
+                        {g.participants.includes(myUserId) ? 'Вы участвуете' : 'УЧАСТВОВАТЬ'}
                       </button>
                     )}
                   </div>
@@ -548,8 +660,11 @@ function App() {
                       <div key={i} className="bg-[#111217] p-4 rounded-2xl flex items-center justify-between border border-white/[0.04]">
                          <div className="flex items-center space-x-3">
                            <div className="w-1 shrink-0 self-stretch rounded-full" style={{ backgroundColor: s.rarityColor || '#5e98d9' }} />
-                           {/* Increased Image size */}
-                           <div className="w-14 h-14 bg-black/40 rounded-lg flex items-center justify-center border border-white/5 relative">
+                           <div className="w-14 h-14 bg-black/40 rounded-lg flex items-center justify-center border border-white/5 relative overflow-hidden">
+                              <div 
+                                className="absolute inset-0 z-0 opacity-10" 
+                                style={{ background: `linear-gradient(135deg, transparent, ${s.rarityColor || '#5e98d9'})` }}
+                              ></div>
                               <img src={s.image} className="w-full h-full object-contain relative z-10" />
                            </div>
                            <div className="min-w-0">
@@ -582,63 +697,72 @@ function App() {
                     {selectedSkins.length > 0 && <button onClick={() => setIsAddingMore(false)} className="text-gray-500 text-[9px] font-black uppercase flex items-center"><ChevronLeft size={14} className="mr-1" /> Отмена</button>}
                  </div>
 
-                 <div className="relative">
-                    <input type="text" placeholder="Название скина..." className="w-full bg-[#111217] border border-white/[0.06] rounded-2xl py-5 pl-12 pr-4 text-sm font-bold outline-none text-white focus:border-[#ff6b00]/50" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleSearch()} />
-                    <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-800" size={18} />
-                    {suggestions.length > 0 && (
-                      <div className="absolute top-full left-0 right-0 mt-2 bg-[#16181d] border border-white/[0.08] rounded-2xl overflow-hidden shadow-2xl z-50">
-                        {suggestions.map((name, i) => (
-                          <button key={i} onClick={() => selectSuggestion(name)} className="w-full text-left px-5 py-4 text-[10px] font-bold text-gray-400 hover:bg-[#ff6b00]/10 border-b border-white/[0.02] last:border-0">{localizeName(name)}</button>
-                        ))}
-                      </div>
-                    )}
+                 {/* Система Избранных: кнопка переключения */}
+                 <div className="flex space-x-2">
+                    <button 
+                      onClick={() => setShowFavoritesOnly(false)}
+                      className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase tracking-wider border transition-all ${!showFavoritesOnly ? 'bg-[#ff6b00] border-[#ff6b00] text-white' : 'bg-[#111217] border-white/[0.05] text-gray-500'}`}
+                    >
+                      Поиск
+                    </button>
+                    <button 
+                      onClick={() => setShowFavoritesOnly(true)}
+                      className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase tracking-wider border transition-all ${showFavoritesOnly ? 'bg-yellow-500 border-yellow-500 text-white' : 'bg-[#111217] border-white/[0.05] text-gray-500'}`}
+                    >
+                      <Star size={12} className="inline-block mr-1 mb-0.5" /> Избранное
+                    </button>
                  </div>
 
-                 {favorites.length > 0 && !searchQuery && (
-                   <div className="space-y-3">
-                      <h3 className="text-[8px] font-black uppercase text-gray-700 px-1 tracking-widest">ИЗБРАННОЕ</h3>
-                      <div className="grid grid-cols-2 gap-3">
-                        {favorites.map((s, i) => (
-                          <div key={i} onClick={() => addPrize(s)} className="bg-[#111217] p-4 rounded-2xl border border-white/[0.04] flex flex-col items-center text-center active:scale-95 transition-all">
-                             <div className="w-16 h-16 bg-black/40 rounded-xl flex items-center justify-center border border-white/5 mb-3 relative">
-                                <img src={s.image} className="w-full h-full object-contain relative z-10" />
-                             </div>
-                             <h4 className="text-[9px] font-bold text-white line-clamp-2">{s.name}</h4>
-                             <p className="text-[#ff6b00] text-[9px] font-black mt-1">{formatPrice(s.price)} ₽</p>
-                          </div>
-                        ))}
-                      </div>
-                   </div>
+                 {!showFavoritesOnly && (
+                    <div className="relative">
+                       <input type="text" placeholder="Название скина..." className="w-full bg-[#111217] border border-white/[0.06] rounded-2xl py-5 pl-12 pr-4 text-sm font-bold outline-none text-white focus:border-[#ff6b00]/50" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleSearch()} />
+                       <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-800" size={18} />
+                       {suggestions.length > 0 && (
+                         <div className="absolute top-full left-0 right-0 mt-2 bg-[#16181d] border border-white/[0.08] rounded-2xl overflow-hidden shadow-2xl z-50">
+                           {suggestions.map((name, i) => (
+                             <button key={i} onClick={() => selectSuggestion(name)} className="w-full text-left px-5 py-4 text-[10px] font-bold text-gray-400 hover:bg-[#ff6b00]/10 border-b border-white/[0.02] last:border-0">{localizeName(name)}</button>
+                           ))}
+                         </div>
+                       )}
+                    </div>
                  )}
 
-                 {searchResults.length > 0 && (
-                   <div className="grid grid-cols-1 gap-4">
-                      {searchResults.map((s, i) => (
-                        <div key={i} className="bg-[#111217] rounded-3xl p-5 border border-white/[0.04] flex flex-col relative overflow-hidden">
+                 {/* Отображение результатов или избранного */}
+                 <div className="grid grid-cols-1 gap-4">
+                    {(showFavoritesOnly ? favorites : searchResults).map((s, i) => {
+                      const { name, exterior } = splitSkinName(s.name);
+                      return (
+                        <div key={i} className="bg-[#111217] rounded-3xl p-5 border border-white/[0.05] flex flex-col relative overflow-hidden shadow-[inset_0_0_20px_rgba(255,255,255,0.02)]">
                            <button onClick={() => toggleFavorite(s)} className="absolute top-4 right-4 z-20 text-gray-700 hover:text-yellow-500 transition-colors">
                               {favorites.some(f => f.name === s.name) ? <Star size={18} fill="#eab308" className="text-yellow-500" /> : <StarOff size={18} />}
                            </button>
                            <div className="flex items-center space-x-6 mb-5">
-                             {/* Line Indicator */}
                              <div className="w-1 self-stretch rounded-full" style={{ backgroundColor: s.rarityColor || '#5e98d9' }} />
-                             
-                             {/* Larger Image in Search Results */}
-                             <div className="w-24 h-24 bg-black/60 rounded-2xl flex items-center justify-center border border-white/5 shrink-0 relative">
+                             <div className="w-24 h-24 bg-black/60 rounded-2xl flex items-center justify-center border border-white/5 shrink-0 relative overflow-hidden">
+                                <div 
+                                  className="absolute inset-0 z-0 opacity-10" 
+                                  style={{ background: `linear-gradient(135deg, transparent, ${s.rarityColor || '#5e98d9'})` }}
+                                ></div>
                                 {s.image && <img src={s.image} className="w-full h-full object-contain relative z-10" style={{ mixBlendMode: 'screen' }} />}
                              </div>
                              <div className="min-w-0 flex-1">
                                <div className="text-[7px] font-black uppercase px-2 py-0.5 border rounded-lg mb-1.5 inline-block" style={{ borderColor: `${s.rarityColor}44`, color: s.rarityColor, backgroundColor: `${s.rarityColor}11` }}>{s.rarity}</div>
-                               {/* Increased Name size */}
-                               <h3 className="font-bold text-sm text-white truncate leading-tight">{s.name}</h3>
-                               {/* Increased Price size */}
-                               <p className="text-[#ff6b00] font-black text-2xl">{formatPrice(s.price)} ₽</p>
+                               <h3 className={`font-black text-sm truncate leading-tight ${['Covert', 'Classified', 'Extraordinary'].includes(s.rarity || '') ? 'animate-gradient text-gradient bg-gradient-to-r from-white via-gray-300 to-white' : 'text-white'}`}>
+                                 {name} <span className="text-gray-400 font-bold">{exterior}</span>
+                               </h3>
+                               <p className="text-2xl font-black bg-gradient-to-r from-orange-400 to-orange-600 text-gradient animate-gradient mt-2">
+                                 {formatPrice(s.price)} ₽
+                               </p>
                              </div>
                            </div>
                            <button onClick={() => addPrize(s)} className="w-full bg-[#22c55e] hover:bg-green-600 text-white py-4 rounded-xl font-black text-[10px] uppercase tracking-widest active:scale-95 transition-all">ВЫБРАТЬ</button>
                         </div>
-                      ))}
-                   </div>
-                 )}
+                      );
+                    })}
+                    {showFavoritesOnly && favorites.length === 0 && (
+                       <div className="text-center py-12 text-gray-600 text-[10px] font-black uppercase tracking-widest opacity-40">Избранных скинов нет</div>
+                    )}
+                 </div>
                </div>
              )}
           </div>
@@ -646,7 +770,7 @@ function App() {
 
         {activeTab === 'settings' && (
           <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="bg-[#111217] rounded-[2.5rem] p-8 border border-white/[0.04] space-y-7">
+            <div className="bg-[#111217]/80 backdrop-blur-md rounded-[2.5rem] p-8 border border-white/[0.05] space-y-7 shadow-xl shadow-[inset_0_0_20px_rgba(255,255,255,0.02)]">
               <h2 className="text-[10px] font-black uppercase text-gray-500 flex items-center"><ShieldCheck size={16} className="mr-3 text-[#ff6b00]" /> НАСТРОЙКИ</h2>
               <div className="space-y-3.5 relative">
                 <label className="text-[9px] font-black text-gray-700 uppercase px-1.5 flex justify-between">Lis-Skins API Key <button onClick={() => setShowKey(!showKey)} className="text-[#ff6b00] lowercase">{showKey ? 'скрыть' : 'показать'}</button></label>
@@ -670,7 +794,7 @@ function App() {
         )}
       </main>
 
-      <nav className="fixed bottom-0 left-0 right-0 z-50 bg-[#090a0d]/90 backdrop-blur-3xl border-t border-white/[0.04] px-6 pt-4 h-24 flex justify-between items-center shadow-[0_-20px_60px_rgba(0,0,0,0.8)]">
+      <nav className="fixed bottom-0 left-0 right-0 z-50 bg-[#090a0d]/95 backdrop-blur-3xl border-t border-white/[0.04] px-6 pt-4 h-24 flex justify-between items-center shadow-[0_-20px_60px_rgba(0,0,0,0.8)]">
         <TabButton active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} icon={<LayoutDashboard size={22} />} label="Главная" />
         <TabButton active={activeTab === 'create'} onClick={() => setActiveTab('create')} icon={<PlusCircle size={22} />} label="Создать" />
         <TabButton active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} icon={<Settings size={22} />} label="Опции" />
@@ -695,9 +819,10 @@ function TabButton({ active, onClick, icon, label }: { active: boolean, onClick:
 
 function StatsCard({ title, value, icon }: { title: string, value: string | number, icon: React.ReactNode }) {
   return (
-    <div className="bg-[#111217] border border-white/[0.04] p-8 rounded-[2.5rem] flex items-center justify-between shadow-2xl">
-      <div className="bg-[#ff6b00]/10 p-4 rounded-2xl text-[#ff6b00]">{icon}</div>
-      <div className="text-right">
+    <div className="bg-[#111217]/80 backdrop-blur-md border border-white/[0.05] p-8 rounded-[2.5rem] flex items-center justify-between shadow-2xl relative overflow-hidden group shadow-[inset_0_0_20px_rgba(255,255,255,0.01)]">
+      <div className="absolute inset-0 bg-gradient-to-br from-white/[0.01] to-transparent pointer-events-none"></div>
+      <div className="bg-[#ff6b00]/10 p-4 rounded-2xl text-[#ff6b00] relative z-10">{icon}</div>
+      <div className="text-right relative z-10">
         <p className="text-[9px] font-black text-gray-700 uppercase mb-2">{title}</p>
         <p className="text-3xl font-black text-white">{value}</p>
       </div>
