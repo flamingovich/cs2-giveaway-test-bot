@@ -143,6 +143,7 @@ function App() {
   const [showKey, setShowKey] = useState(false);
   const [currentTime, setCurrentTime] = useState(Date.now());
   const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
+  const [isCheckingSub, setIsCheckingSub] = useState<string | null>(null);
   
   // Идентификатор текущего пользователя для имитации системы
   const myUserId = useMemo(() => {
@@ -467,11 +468,42 @@ function App() {
     addLog(`Розыгрыш ${id} завершен досрочно.`);
   };
 
-  const toggleParticipation = (giveawayId: string) => {
+  const toggleParticipation = async (giveawayId: string) => {
+    const tg = (window as any).Telegram?.WebApp;
+    const realUserId = tg?.initDataUnsafe?.user?.id;
+    const targetGiveaway = giveaways.find(g => g.id === giveawayId);
+    
+    if (!targetGiveaway || targetGiveaway.status !== 'active') return;
+
+    const userAlreadyParticipating = targetGiveaway.participants.includes(myUserId);
+
+    // Только если пользователь еще не участвует, проверяем подписку
+    if (!userAlreadyParticipating) {
+      setIsCheckingSub(giveawayId);
+      try {
+        // Вызов API эндпоинта для проверки подписки
+        const checkRes = await fetch(`/api/check-sub?userId=${realUserId || 12345}`);
+        const data = await checkRes.json();
+        
+        if (!data.subscribed) {
+          tg?.showAlert("Чтобы участвовать, подпишись на наш канал!");
+          tg?.openTelegramLink("https://t.me/bot_ppgtest");
+          setIsCheckingSub(null);
+          return;
+        }
+      } catch (e: any) {
+        addLog("Ошибка проверки подписки: " + e.message);
+        setIsCheckingSub(null);
+        return;
+      } finally {
+        setIsCheckingSub(null);
+      }
+    }
+
     setGiveaways(prev => prev.map(g => {
       if (g.id === giveawayId && g.status === 'active') {
-        const isAlreadyIn = g.participants.includes(myUserId);
-        if (isAlreadyIn) {
+        const isUserIn = g.participants.includes(myUserId);
+        if (isUserIn) {
           return { ...g, participants: g.participants.filter(p => p !== myUserId) };
         } else {
           return { ...g, participants: [...g.participants, myUserId] };
@@ -631,13 +663,14 @@ function App() {
                       </div>
                     )}
 
-                    {/* Participate Button with Animated Gradient */}
+                    {/* Participate Button with Loading State and Subscription Check */}
                     {g.status === 'active' && (
                       <button 
                         onClick={() => toggleParticipation(g.id)}
-                        className={`w-full mt-4 py-4 rounded-2xl font-black text-[11px] uppercase tracking-[0.2em] transition-all shadow-xl shadow-green-900/10 animate-gradient ${g.participants.includes(myUserId) ? 'bg-green-500/10 text-green-500 border border-green-500/20' : 'bg-gradient-to-r from-green-400 to-green-600 text-white active:scale-95'}`}
+                        disabled={isCheckingSub === g.id}
+                        className={`w-full mt-4 py-4 rounded-2xl font-black text-[11px] uppercase tracking-[0.2em] transition-all shadow-xl shadow-green-900/10 animate-gradient ${isCheckingSub === g.id ? 'opacity-50 cursor-not-allowed' : ''} ${g.participants.includes(myUserId) ? 'bg-green-500/10 text-green-500 border border-green-500/20' : 'bg-gradient-to-r from-green-400 to-green-600 text-white active:scale-95'}`}
                       >
-                        {g.participants.includes(myUserId) ? 'Вы участвуете' : 'УЧАСТВОВАТЬ'}
+                        {isCheckingSub === g.id ? 'ПРОВЕРКА...' : (g.participants.includes(myUserId) ? 'Вы участвуете' : 'УЧАСТВОВАТЬ')}
                       </button>
                     )}
                   </div>
